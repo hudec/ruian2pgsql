@@ -21,11 +21,6 @@
  */
 package com.fordfrog.ruian2pgsql.convertors;
 
-import com.fordfrog.ruian2pgsql.Config;
-import com.fordfrog.ruian2pgsql.gml.GMLUtils;
-import com.fordfrog.ruian2pgsql.utils.Log;
-import com.fordfrog.ruian2pgsql.utils.Namespaces;
-import com.fordfrog.ruian2pgsql.utils.XMLUtils;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
@@ -43,12 +38,22 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
+
 import javax.xml.stream.XMLInputFactory;
 import javax.xml.stream.XMLStreamException;
 import javax.xml.stream.XMLStreamReader;
+
+import com.fordfrog.ruian2pgsql.Config;
+import com.fordfrog.ruian2pgsql.gml.GMLUtils;
+import com.fordfrog.ruian2pgsql.utils.Log;
+import com.fordfrog.ruian2pgsql.utils.Namespaces;
+import com.fordfrog.ruian2pgsql.utils.XMLUtils;
 
 /**
  * Converts RÚIAN data into PostgreSQL database.
@@ -57,15 +62,46 @@ import javax.xml.stream.XMLStreamReader;
  */
 public class MainConvertor {
 
-    /**
-     * Exchange format convertor instance.
-     */
-    private static ExchangeFormatConvertor exchangeFormatConvertor;
+//    /**
+//     * Exchange format convertor instance.
+//     */
+//    private static ExchangeFormatConvertor exchangeFormatConvertor;
+//
+//    /**
+//     * Special exchange format convertor instance.
+//     */
+//    private static SpecialExchangeFormatConvertor specialExchangeFormatConvertor;
 
-    /**
-     * Special exchange format convertor instance.
-     */
-    private static SpecialExchangeFormatConvertor specialExchangeFormatConvertor;
+    // WorkerCtx.java (put it next to MainConvertor)
+
+    final static class WorkerCtx implements AutoCloseable {
+        private final Connection conn;
+        private final ExchangeFormatConvertor exch;
+        private final SpecialExchangeFormatConvertor spc;
+
+        WorkerCtx(Connection conn) throws SQLException {
+            this.conn = conn;
+            this.exch = new ExchangeFormatConvertor(conn);
+            this.spc = new SpecialExchangeFormatConvertor(conn);
+        }
+
+        Connection conn() {
+            return conn;
+        }
+
+        ExchangeFormatConvertor exch() {
+            return exch;
+        }
+
+        SpecialExchangeFormatConvertor spc() {
+            return spc;
+        }
+
+        @Override
+        public void close() throws SQLException {
+            conn.close();
+        }
+    }
 
     /**
      * Creates new instance of MainConvertor.
@@ -74,24 +110,18 @@ public class MainConvertor {
     }
 
     /**
-     * Converts all files with .xml.gz and .xml extensions from specified
-     * directory into database.
+     * Converts all files with .xml.gz and .xml extensions from specified directory into database.
      *
-     * @throws XMLStreamException Thrown if problem occurred while reading XML
-     *                            stream.
-     * @throws SQLException       Thrown if problem occurred while communicating
-     *                            with database.
+     * @throws XMLStreamException Thrown if problem occurred while reading XML stream.
+     * @throws SQLException       Thrown if problem occurred while communicating with database.
      */
-    public static void convert()
-            throws XMLStreamException, SQLException {
+    public static void convert() throws XMLStreamException, SQLException {
         final long startTimestamp = System.currentTimeMillis();
 
-        try (final Connection con = DriverManager.getConnection(
-                Config.getDbConnectionUrl())) {
-            exchangeFormatConvertor = new ExchangeFormatConvertor(con);
-            specialExchangeFormatConvertor = new SpecialExchangeFormatConvertor(con);
+        try (final Connection con = DriverManager.getConnection(Config.getDbConnectionUrl())) {
+//            exchangeFormatConvertor = new ExchangeFormatConvertor(con);
+//            specialExchangeFormatConvertor = new SpecialExchangeFormatConvertor(con);
 
-            
             con.setAutoCommit(false);
 
             if (Config.isCreateTables()) {
@@ -124,22 +154,44 @@ public class MainConvertor {
                 runSQLFromResource(con, "/sql/reset_transaction_ids.sql");
             }
 
-            if (!Config.isNoGis() && !Config.isMysqlDriver()
-                    && !Config.isConvertToEWKT()
+            if (!Config.isNoGis() && !Config.isMysqlDriver() && !Config.isConvertToEWKT()
                     && GMLUtils.checkMultipointBug(con)) {
-                Log.write("Installed version of Postgis is affected by "
-                        + "multipoint bug "
-                        + "http://trac.osgeo.org/postgis/ticket/1928, enabling "
-                        + "workaround...");
+                Log.write("Installed version of Postgis is affected by " + "multipoint bug "
+                        + "http://trac.osgeo.org/postgis/ticket/1928, enabling " + "workaround...");
                 GMLUtils.setMultipointBugWorkaround(true);
             }
 
             con.commit();
 
-            for (final Path file : getInputFiles(Config.getInputDirPath())) {
-                processFile(file);
-                con.commit();
+//            for (final Path file : getInputFiles(Config.getInputDirPath())) {
+//                processFile(file);
+//                con.commit();
+//            }
+
+            final List<Path> files = getInputFiles(Config.getInputDirPath());
+
+            final int nThreads = Math.min(Config.getThreads(), files.size());
+            final ExecutorService pool = Executors.newFixedThreadPool(nThreads, r -> {
+                Thread t = new Thread(r, "r2p-" + r.hashCode());
+                t.setDaemon(false);
+                return t;
+            });
+
+            for (Path file : files) {
+                pool.submit(() -> {
+                    try (WorkerCtx ctx = new WorkerCtx(DriverManager.getConnection(Config.getDbConnectionUrl()))) {
+                        ctx.conn().setAutoCommit(false);
+                        processFile(file, ctx);
+                        ctx.conn().commit();
+                    } catch (Exception ex) {
+                        Log.write("ERROR processing " + file + ": " + ex.getMessage());
+                        throw new RuntimeException(ex);
+                    }
+                });
             }
+
+            pool.shutdown();
+            pool.awaitTermination(Long.MAX_VALUE, TimeUnit.HOURS);
 
             if (Config.isCreateTables()) {
                 Log.write("Creating indexes...");
@@ -155,8 +207,10 @@ public class MainConvertor {
                 }
             }
 
-            Log.write("Total duration: "
-                    + (System.currentTimeMillis() - startTimestamp) + " ms");
+            Log.write("Total duration: " + (System.currentTimeMillis() - startTimestamp) + " ms");
+        } catch (InterruptedException e) {
+            // TODO Auto-generated catch block
+            e.printStackTrace();
         }
     }
 
@@ -164,11 +218,9 @@ public class MainConvertor {
      * Runs SQL statements from specified resource.
      *
      * @param con          database connection
-     * @param resourceName name of the resource from which to read the SQL
-     *                     statements
+     * @param resourceName name of the resource from which to read the SQL statements
      */
-    private static void runSQLFromResource(final Connection con,
-            final String resourceName) {
+    private static void runSQLFromResource(final Connection con, final String resourceName) {
         if (Config.isDryRun()) {
             return;
         }
@@ -176,9 +228,7 @@ public class MainConvertor {
         final StringBuilder sbSQL = new StringBuilder(10_240);
 
         try (final BufferedReader reader = new BufferedReader(
-                new InputStreamReader(
-                MainConvertor.class.getResourceAsStream(
-                resourceName), "UTF-8"));
+                new InputStreamReader(MainConvertor.class.getResourceAsStream(resourceName), "UTF-8"));
                 final Statement stm = con.createStatement()) {
             String line = reader.readLine();
 
@@ -195,11 +245,9 @@ public class MainConvertor {
                 line = reader.readLine();
             }
         } catch (final SQLException ex) {
-            throw new RuntimeException(
-                    "Statement failed: " + sbSQL.toString(), ex);
+            throw new RuntimeException("Statement failed: " + sbSQL.toString(), ex);
         } catch (final IOException ex) {
-            throw new RuntimeException(
-                    "Failed to read SQL statements from resource", ex);
+            throw new RuntimeException("Failed to read SQL statements from resource", ex);
         }
     }
 
@@ -213,8 +261,7 @@ public class MainConvertor {
     private static List<Path> getInputFiles(final Path inputDirPath) {
         final List<Path> result = new ArrayList<>(10);
 
-        try (final DirectoryStream<Path> files =
-                Files.newDirectoryStream(inputDirPath)) {
+        try (final DirectoryStream<Path> files = Files.newDirectoryStream(inputDirPath)) {
             final Iterator<Path> filesIterator = files.iterator();
 
             while (filesIterator.hasNext()) {
@@ -225,15 +272,13 @@ public class MainConvertor {
                 }
             }
         } catch (final IOException ex) {
-            throw new RuntimeException(
-                    "Failed to read content of input directory", ex);
+            throw new RuntimeException("Failed to read content of input directory", ex);
         }
 
         Collections.sort(result, new Comparator<Path>() {
             @Override
             public int compare(final Path o1, final Path o2) {
-                return o1.getFileName().toString().compareTo(
-                        o2.getFileName().toString());
+                return o1.getFileName().toString().compareTo(o2.getFileName().toString());
             }
         });
 
@@ -245,15 +290,11 @@ public class MainConvertor {
      *
      * @param file file path
      *
-     * @throws UnsupportedEncodingException Thrown if UTF-8 encoding is not
-     *                                      supported.
-     * @throws XMLStreamException           Thrown if problem occurred while
-     *                                      reading XML stream.
-     * @throws SQLException                 Thrown if problem occurred while
-     *                                      communicating with database.
+     * @throws UnsupportedEncodingException Thrown if UTF-8 encoding is not supported.
+     * @throws XMLStreamException           Thrown if problem occurred while reading XML stream.
+     * @throws SQLException                 Thrown if problem occurred while communicating with database.
      */
-    private static void processFile(final Path file) throws XMLStreamException,
-            SQLException {
+    private static void processFile(final Path file, final WorkerCtx ctx) throws XMLStreamException, SQLException {
         final String fileName = file.toString();
 
         if (fileName.endsWith(".xml.gz") || fileName.endsWith(".xml.zip") || fileName.endsWith(".xml")) {
@@ -264,23 +305,20 @@ public class MainConvertor {
 
             try (final InputStream inputStream = Files.newInputStream(file)) {
                 if (fileName.endsWith(".gz")) {
-                    readInputStream(new GZIPInputStream(inputStream));
-                } 
-                else if (fileName.endsWith(".zip")) {
-                	ZipFile zif = new ZipFile(fileName);
-                	ZipEntry ze = zif.entries().nextElement();
-                	readInputStream(zif.getInputStream(ze));
-                	zif.close();
-				}
-                else {
-                    readInputStream(inputStream);
+                    readInputStream(new GZIPInputStream(inputStream), ctx);
+                } else if (fileName.endsWith(".zip")) {
+                    ZipFile zif = new ZipFile(fileName);
+                    ZipEntry ze = zif.entries().nextElement();
+                    readInputStream(zif.getInputStream(ze), ctx);
+                    zif.close();
+                } else {
+                    readInputStream(inputStream, ctx);
                 }
             } catch (final IOException ex) {
                 throw new RuntimeException("Failed to read input file", ex);
             }
 
-            Log.write("File processed in "
-                    + (System.currentTimeMillis() - startTimestamp) + " ms");
+            Log.write("File processed in " + (System.currentTimeMillis() - startTimestamp) + " ms");
             Log.flush();
         } else {
             Log.write("Unsupported file extension, ignoring file " + file);
@@ -292,20 +330,17 @@ public class MainConvertor {
      *
      * @param inputStream input stream containing XML data
      *
-     * @throws XMLStreamException Thrown if problem occurred while reading XML
-     *                            stream.
-     * @throws SQLException       Thrown if problem occurred while communicating
-     *                            with database.
+     * @throws XMLStreamException Thrown if problem occurred while reading XML stream.
+     * @throws SQLException       Thrown if problem occurred while communicating with database.
      */
-    private static void readInputStream(final InputStream inputStream)
+    private static void readInputStream(final InputStream inputStream, final WorkerCtx ctx)
             throws XMLStreamException, SQLException {
         final XMLInputFactory xMLInputFactory = XMLInputFactory.newInstance();
 
         final XMLStreamReader reader;
 
         try {
-            reader = xMLInputFactory.createXMLStreamReader(
-                    new InputStreamReader(inputStream, "UTF-8"));
+            reader = xMLInputFactory.createXMLStreamReader(new InputStreamReader(inputStream, "UTF-8"));
         } catch (final UnsupportedEncodingException ex) {
             throw new RuntimeException("UTF-8 encoding is not supported", ex);
         }
@@ -314,7 +349,7 @@ public class MainConvertor {
             final int event = reader.next();
 
             if (event == XMLStreamReader.START_ELEMENT) {
-                processElement(reader);
+                processElement(reader, ctx);
             }
         }
     }
@@ -324,34 +359,34 @@ public class MainConvertor {
      *
      * @param reader XML stream reader
      *
-     * @throws XMLStreamException Thrown if problem occurred while reading XML
-     *                            stream.
-     * @throws SQLException       Thrown if problem occurred while communicating
-     *                            with database.
+     * @throws XMLStreamException Thrown if problem occurred while reading XML stream.
+     * @throws SQLException       Thrown if problem occurred while communicating with database.
      */
-    private static void processElement(final XMLStreamReader reader)
+    private static void processElement(final XMLStreamReader reader, final WorkerCtx ctx)
             throws XMLStreamException, SQLException {
         switch (reader.getNamespaceURI()) {
-            case Namespaces.VYMENNY_FORMAT_TYPY:
-                switch (reader.getLocalName()) {
-                    case "VymennyFormat":
-                        exchangeFormatConvertor.convert(reader);
-                        break;
-                    default:
-                        XMLUtils.processUnsupported(reader);
-                }
-                break;
-            case Namespaces.SPECIALNI_VYMENNY_FORMAT_TYPY:
-                switch (reader.getLocalName()) {
-                    case "SpecialniVymennyFormat":
-                        specialExchangeFormatConvertor.convert(reader);
-                        break;
-                    default:
-                        XMLUtils.processUnsupported(reader);
-                }
+        case Namespaces.VYMENNY_FORMAT_TYPY:
+            switch (reader.getLocalName()) {
+            case "VymennyFormat":
+//                exchangeFormatConvertor.convert(reader);
+                ctx.exch().convert(reader);
                 break;
             default:
                 XMLUtils.processUnsupported(reader);
+            }
+            break;
+        case Namespaces.SPECIALNI_VYMENNY_FORMAT_TYPY:
+            switch (reader.getLocalName()) {
+            case "SpecialniVymennyFormat":
+//                specialExchangeFormatConvertor.convert(reader);
+                ctx.spc().convert(reader);
+                break;
+            default:
+                XMLUtils.processUnsupported(reader);
+            }
+            break;
+        default:
+            XMLUtils.processUnsupported(reader);
         }
     }
 }

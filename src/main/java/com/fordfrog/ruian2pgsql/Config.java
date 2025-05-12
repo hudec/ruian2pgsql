@@ -43,8 +43,7 @@ public class Config {
      */
     private static boolean createTables;
     /**
-     * Flag determining whether all transaction ids should be reset so that all
-     * records would be updated.
+     * Flag determining whether all transaction ids should be reset so that all records would be updated.
      */
     private static boolean resetTransactionIds;
     /**
@@ -52,8 +51,7 @@ public class Config {
      */
     private static boolean ignoreInvalidGML;
     /**
-     * Whether geometries should be converted to EWKT before they are stored in
-     * database.
+     * Whether geometries should be converted to EWKT before they are stored in database.
      */
     private static boolean convertToEWKT;
     /**
@@ -61,8 +59,7 @@ public class Config {
      */
     private static boolean debug;
     /**
-     * If set to true, input files are processed but no data is stored in
-     * database.
+     * If set to true, input files are processed but no data is stored in database.
      */
     private static boolean dryRun;
     /**
@@ -89,6 +86,16 @@ public class Config {
      * Whether EWKT geometries should be linearized before they are stored in database.
      */
     private static boolean linearizeEWKT;
+
+    private static int threads = Runtime.getRuntime().availableProcessors() / 3;
+
+    public static int getThreads() {
+        return threads;
+    }
+
+    public static void setThreads(int t) {
+        threads = t;
+    }
 
     /**
      * Getter for {@link #inputDirPath}.
@@ -158,8 +165,7 @@ public class Config {
      *
      * @param resetTransactionIds {@link #resetTransactionIds}
      */
-    public static void setResetTransactionIds(
-            final boolean resetTransactionIds) {
+    public static void setResetTransactionIds(final boolean resetTransactionIds) {
         Config.resetTransactionIds = resetTransactionIds;
     }
 
@@ -295,8 +301,7 @@ public class Config {
      * @return true if MySQL driver is used, otherwise false
      */
     public static boolean isMysqlDriver() {
-        return dbConnectionUrl != null
-                && dbConnectionUrl.startsWith("jdbc:mysql:");
+        return dbConnectionUrl != null && dbConnectionUrl.startsWith("jdbc:mysql:");
     }
 
     /**
